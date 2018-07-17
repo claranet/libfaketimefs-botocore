@@ -1,8 +1,9 @@
 import botocore.auth
+import botocore.credentials
+import datetime
 import os
-import re
 
-from datetime import timedelta
+from dateutil.parser import parse
 
 
 FAKETIME_REALTIME_FILE = os.environ.get('FAKETIME_REALTIME_FILE')
@@ -13,6 +14,27 @@ def real_time():
         return float(open_file.read())
 
 
+class PatchedDate(datetime.date):
+
+    @classmethod
+    def today(cls):
+        t = real_time()
+        return cls.fromtimestamp(t)
+
+
+class PatchedDatetime(datetime.datetime):
+
+    @classmethod
+    def now(cls, tz=None):
+        t = real_time()
+        return cls.fromtimestamp(t, tz)
+
+    @classmethod
+    def utcnow(cls):
+        t = real_time()
+        return cls.utcfromtimestamp(t)
+
+
 class PatchedDatetimeModule(object):
     """
     Wrapper for the datetime module that uses libfaketimefs's realtime file
@@ -21,31 +43,8 @@ class PatchedDatetimeModule(object):
 
     """
 
-    def __init__(self, datetime):
-
-        self._datetime = datetime
-
-        class date(datetime.date):
-
-            @classmethod
-            def today(cls):
-                t = real_time()
-                return cls.fromtimestamp(t)
-
-        class datetime(datetime.datetime):
-
-            @classmethod
-            def now(cls, tz=None):
-                t = real_time()
-                return cls.fromtimestamp(t, tz)
-
-            @classmethod
-            def utcnow(cls):
-                t = real_time()
-                return cls.utcfromtimestamp(t)
-
-        self.date = date
-        self.datetime = datetime
+    date = PatchedDate
+    datetime = PatchedDatetime
 
     def __getattr__(self, name):
         return getattr(self._datetime, name)
@@ -57,14 +56,42 @@ def patch_botocore():
 
     """
 
-    if FAKETIME_REALTIME_FILE:
+    # Do nothing when not configured correctly.
 
-        botocore.auth.datetime = PatchedDatetimeModule(
-            datetime=botocore.auth.datetime,
-        )
+    if not FAKETIME_REALTIME_FILE:
+        return
 
-        # It looks like requests made using some older AWS signature versions
-        # would require patching the following variables, but I'm not sure
-        # how to test them so they haven't been patched.
-        # * botocore.auth.formatdate for email.formatdate(usegmt=True)
-        # * botocore.auth.time for time.gmtime() and time.time()
+    # Create a patched datetime module that bypasses libfaketime
+    # and returns the real time.
+
+    patched_datetime_module = PatchedDatetimeModule()
+
+    # Patch the botocore.auth module.
+
+    botocore.auth.datetime = patched_datetime_module
+
+    # It looks like requests made using some older AWS signature versions
+    # would require patching the following variables, but I'm not sure
+    # how to test them so they haven't been patched.
+    # * botocore.auth.formatdate for email.formatdate(usegmt=True)
+    # * botocore.auth.time for time.gmtime() and time.time()
+
+    # Patch the botocore.credentials module.
+
+    botocore.credentials.datetime = patched_datetime_module
+
+    def _parse_if_needed(value):
+        if isinstance(value, datetime.datetime):
+            return value
+        return parse(value)
+
+    botocore.credentials._parse_if_needed = _parse_if_needed
+
+    def _serialize_if_needed(value, iso=False):
+        if isinstance(value, datetime.datetime):
+            if iso:
+                return value.isoformat()
+            return value.strftime('%Y-%m-%dT%H:%M:%S%Z')
+        return value
+
+    botocore.credentials._serialize_if_needed = _serialize_if_needed
